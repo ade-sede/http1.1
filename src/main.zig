@@ -203,10 +203,41 @@ fn readRequest(reader: *std.net.Stream.Reader) !*Request {
 }
 
 fn echo(request: *Request, stream: *std.net.Stream) !void {
+    if (request.segments.items.len != 2) {
+        _ = try stream.write("HTTP/1.1 422 Unprocessable Content\r\n\r\n");
+        return;
+    }
+
     const response = try Response.text(request.segments.items[1]);
     const bytes = try response.pack();
 
     std.debug.print("{s}", .{bytes});
+
+    _ = try stream.write(bytes);
+}
+
+fn userAgent(request: *Request, stream: *std.net.Stream) !void {
+    if (request.segments.items.len != 1) {
+        _ = try stream.write("HTTP/1.1 422 Unprocessable Content\r\n\r\n");
+        return;
+    }
+
+    const user_agent: []const u8 = blk: {
+        for (request.headers.raw.items) |header| {
+            if (std.mem.startsWith(u8, header, "User-Agent: ")) {
+                // `User-Agent: <value>`
+                if (std.mem.indexOf(u8, header, ": ")) |index| {
+                    break :blk header[index + 2 ..];
+                }
+            }
+        } else {
+            _ = try stream.write("HTTP/1.1 400 Bad Request\r\n\r\n");
+            return;
+        }
+    };
+
+    const response = try Response.text(user_agent);
+    const bytes = try response.pack();
 
     _ = try stream.write(bytes);
 }
@@ -227,10 +258,9 @@ pub fn main() !void {
         if (std.mem.eql(u8, request.target, "/")) {
             _ = try conn.stream.write("HTTP/1.1 200 OK\r\n\r\n");
         } else if (std.mem.startsWith(u8, request.target, "/echo/")) {
-            if (request.segments.items.len == 2) {
-                return echo(request, &conn.stream);
-            }
-            _ = try conn.stream.write("HTTP/1.1 422 Unprocessable Content\r\n\r\n");
+            return echo(request, &conn.stream);
+        } else if (std.mem.startsWith(u8, request.target, "/user-agent")) {
+            return userAgent(request, &conn.stream);
         } else {
             _ = try conn.stream.write("HTTP/1.1 404 Not Found\r\n\r\n");
         }
