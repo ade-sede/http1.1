@@ -215,10 +215,9 @@ fn echo(allocator: std.mem.Allocator, request: *Request, stream: std.net.Stream)
     }
 
     const response = try Response.text(allocator, request.segments.items[1]);
+    defer response.deinit();
     const bytes = try response.pack();
     defer allocator.free(bytes);
-
-    std.debug.print("{s}", .{bytes});
 
     _ = try stream.write(bytes);
 }
@@ -244,6 +243,7 @@ fn userAgent(allocator: std.mem.Allocator, request: *Request, stream: std.net.St
     };
 
     const response = try Response.text(allocator, user_agent);
+    defer response.deinit();
     const bytes = try response.pack();
     defer allocator.free(bytes);
 
