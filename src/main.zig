@@ -99,23 +99,41 @@ const Response = struct {
         response.reason = try allocator.dupe(u8, "OK");
         response.body = try allocator.dupe(u8, txt);
 
-        try response.headers.raw.append(try allocator.dupe(u8, "Content-Type: text/plain\r\n"));
-        try response.headers.raw.append(try std.fmt.allocPrint(allocator, "Content-Length: {d}\r\n", .{txt.len}));
+        try response.headers.raw.append(try allocator.dupe(u8, "Content-Type: text/plain"));
+        try response.headers.raw.append(try std.fmt.allocPrint(allocator, "Content-Length: {d}", .{txt.len}));
 
         return response;
     }
 
+    fn packHeaders(headers: []const []const u8) ![]const u8 {
+        // A header section is of the form
+        //
+        // header_line\r\n
+        // header_line\r\n
+        // \r\n (trailing CRLF to mark end of section)
+
+        const packed_headers = try std.mem.join(allocator, "\r\n", headers);
+        defer allocator.free(packed_headers);
+
+        if (headers.len != 0) {
+            return std.mem.concat(allocator, u8, &[_][]const u8{ packed_headers, "\r\n", "\r\n" });
+        } else {
+            return std.mem.concat(allocator, u8, &[_][]const u8{ packed_headers, "\r\n" });
+        }
+    }
+
     pub fn pack(self: *Response) ![]const u8 {
         const status_line = try std.fmt.allocPrint(allocator, "{s} {d} {s}\r\n", .{ self.http_version, self.code, self.reason });
-        const header_section = try std.mem.join(allocator, "", self.headers.raw.items);
-        defer allocator.free(header_section);
         defer allocator.free(status_line);
 
+        const header_section = try Response.packHeaders(self.headers.raw.items);
+        defer allocator.free(header_section);
+
         if (self.body) |body| {
-            return std.mem.concat(allocator, u8, &[_][]const u8{ status_line, header_section, "\r\n", body });
+            return std.mem.concat(allocator, u8, &[_][]const u8{ status_line, header_section, body });
         }
 
-        return std.mem.concat(allocator, u8, &[_][]const u8{ status_line, header_section, "\r\n" });
+        return std.mem.concat(allocator, u8, &[_][]const u8{ status_line, header_section });
     }
 
     pub fn deinit(self: *Response) void {
