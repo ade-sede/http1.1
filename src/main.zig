@@ -6,10 +6,16 @@ const Headers = struct {
     allocator: std.mem.Allocator,
     raw: std.ArrayList([]const u8),
     content_length: ?usize,
+    // slice of raw, no need to free items
+    accept_encoding: ?std.ArrayList([]const u8),
 
     pub fn deinit(self: *Headers) void {
         for (self.raw.items) |h| {
             self.allocator.free(h);
+        }
+
+        if (self.accept_encoding) |encoding_list| {
+            encoding_list.deinit();
         }
 
         self.raw.deinit();
@@ -45,6 +51,7 @@ const Request = struct {
                 .allocator = allocator,
                 .raw = std.ArrayList([]const u8).init(allocator),
                 .content_length = null,
+                .accept_encoding = null,
             },
             .body = null,
         };
@@ -86,6 +93,7 @@ const Response = struct {
                 .allocator = allocator,
                 .raw = std.ArrayList([]const u8).init(allocator),
                 .content_length = null,
+                .accept_encoding = null,
             },
             .body = null,
         };
@@ -156,7 +164,31 @@ const Response = struct {
         }
     }
 
-    pub fn pack(self: *Response) ![]const u8 {
+    fn encode(self: *Response, request_headers: *Headers) !void {
+        if (request_headers.accept_encoding) |encodings| {
+            const encoding_to_use: []const u8 = blk: {
+                for (encodings.items) |encoding| {
+                    if (std.mem.eql(u8, encoding, "gzip")) {
+                        break :blk "gzip";
+                    }
+                } else {
+                    return error.InvalidEncodingRequested;
+                }
+            };
+
+            const encoding_header = try std.fmt.allocPrint(self.headers.allocator, "Content-Encoding: {s}", .{encoding_to_use});
+            try self.headers.raw.append(encoding_header);
+        }
+    }
+
+    pub fn pack(self: *Response, request_headers: *Headers) ![]const u8 {
+        self.encode(request_headers) catch |err| {
+            switch (err) {
+                error.InvalidEncodingRequested => {},
+                else => return err,
+            }
+        };
+
         const status_line = try std.fmt.allocPrint(self.allocator, "{s} {d} {s}\r\n", .{ self.http_version, self.code, self.reason });
         defer self.allocator.free(status_line);
 
@@ -250,6 +282,19 @@ fn readRequest(allocator: std.mem.Allocator, reader: *std.net.Stream.Reader) !*R
                 }
             }
         }
+
+        if (std.mem.startsWith(u8, header_line, "Accept-Encoding:")) {
+            if (std.mem.indexOf(u8, header_line, ": ")) |index| {
+                request.headers.accept_encoding = std.ArrayList([]const u8).init(allocator);
+
+                const encodings = header_line[index + 2 ..];
+                var encoding_iterator = std.mem.splitSequence(u8, encodings, ",");
+
+                while (encoding_iterator.next()) |encoding_format| {
+                    try request.headers.accept_encoding.?.append(encoding_format);
+                }
+            }
+        }
     }
 
     if (request.headers.content_length) |length| {
@@ -271,7 +316,7 @@ fn echo(allocator: std.mem.Allocator, request: *Request, stream: std.net.Stream)
 
     const response = try Response.text(allocator, request.segments.items[1]);
     defer response.deinit();
-    const bytes = try response.pack();
+    const bytes = try response.pack(&request.headers);
     defer allocator.free(bytes);
 
     _ = try stream.write(bytes);
@@ -299,7 +344,7 @@ fn userAgent(allocator: std.mem.Allocator, request: *Request, stream: std.net.St
 
     const response = try Response.text(allocator, user_agent);
     defer response.deinit();
-    const bytes = try response.pack();
+    const bytes = try response.pack(&request.headers);
     defer allocator.free(bytes);
 
     _ = try stream.write(bytes);
@@ -346,7 +391,7 @@ fn getFile(allocator: std.mem.Allocator, request: *Request, stream: std.net.Stre
 
     const response = try Response.file(allocator, file_content);
     defer response.deinit();
-    const bytes = try response.pack();
+    const bytes = try response.pack(&request.headers);
     defer allocator.free(bytes);
 
     _ = try stream.write(bytes);
