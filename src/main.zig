@@ -15,9 +15,14 @@ const Headers = struct {
     }
 };
 
+const Method = enum {
+    GET,
+    POST,
+};
+
 const Request = struct {
     allocator: std.mem.Allocator,
-    method: []const u8,
+    method: Method,
     target: []const u8,
     // `segments` borrow from target
     segments: std.ArrayList([]const u8),
@@ -46,7 +51,6 @@ const Request = struct {
         self.headers.deinit();
         self.segments.deinit();
 
-        self.allocator.free(self.method);
         self.allocator.free(self.target);
         self.allocator.free(self.http_version);
 
@@ -200,7 +204,16 @@ fn readRequest(allocator: std.mem.Allocator, reader: *std.net.Stream.Reader) !*R
     var request = try Request.init(allocator);
     errdefer request.deinit();
 
-    request.method = request_line[0];
+    request.method = blk: {
+        if (std.mem.eql(u8, request_line[0], "GET")) {
+            break :blk Method.GET;
+        } else if (std.mem.eql(u8, request_line[0], "POST")) {
+            break :blk Method.POST;
+        } else {
+            return error.UnsupportedMethod;
+        }
+    };
+
     request.target = request_line[1];
     request.http_version = request_line[2];
 
