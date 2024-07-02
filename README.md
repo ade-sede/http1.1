@@ -17,3 +17,6 @@ $> curl -X GET 'http://localhost:4221/user-agent'
 Supports gzip compression.
 
 
+# TODO
+
+- Check for memory leaks
