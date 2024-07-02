@@ -5,6 +5,7 @@ const max_read_length = 1024;
 const Headers = struct {
     allocator: std.mem.Allocator,
     raw: std.ArrayList([]const u8),
+    content_length: ?usize,
 
     pub fn deinit(self: *Headers) void {
         for (self.raw.items) |h| {
@@ -43,6 +44,7 @@ const Request = struct {
             .headers = Headers{
                 .allocator = allocator,
                 .raw = std.ArrayList([]const u8).init(allocator),
+                .content_length = null,
             },
             .body = null,
         };
@@ -83,6 +85,7 @@ const Response = struct {
             .headers = Headers{
                 .allocator = allocator,
                 .raw = std.ArrayList([]const u8).init(allocator),
+                .content_length = null,
             },
             .body = null,
         };
@@ -229,8 +232,6 @@ fn readRequest(allocator: std.mem.Allocator, reader: *std.net.Stream.Reader) !*R
         try request.segments.append(segment);
     }
 
-    var content_length: ?usize = null;
-
     while (true) {
         const header_line = try readHeader(allocator, reader);
 
@@ -245,13 +246,13 @@ fn readRequest(allocator: std.mem.Allocator, reader: *std.net.Stream.Reader) !*R
                 const length = try std.fmt.parseInt(usize, header_line[index + 2 ..], 10);
 
                 if (length > 0) {
-                    content_length = length;
+                    request.headers.content_length = length;
                 }
             }
         }
     }
 
-    if (content_length) |length| {
+    if (request.headers.content_length) |length| {
         var body: []u8 = undefined;
         body = try allocator.allocSentinel(u8, length, 0);
         _ = try reader.read(body);
