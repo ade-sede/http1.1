@@ -30,6 +30,8 @@ const Request = struct {
 
     headers: Headers,
 
+    body: ?[]const u8,
+
     pub fn init(allocator: std.mem.Allocator) !*Request {
         const request = try allocator.create(Request);
         request.* = Request{
@@ -42,6 +44,7 @@ const Request = struct {
                 .allocator = allocator,
                 .raw = std.ArrayList([]const u8).init(allocator),
             },
+            .body = null,
         };
 
         return request;
@@ -53,6 +56,10 @@ const Request = struct {
 
         self.allocator.free(self.target);
         self.allocator.free(self.http_version);
+
+        if (self.body) |body| {
+            self.allocator.free(body);
+        }
 
         self.allocator.destroy(self);
     }
@@ -77,7 +84,7 @@ const Response = struct {
                 .allocator = allocator,
                 .raw = std.ArrayList([]const u8).init(allocator),
             },
-            .body = undefined,
+            .body = null,
         };
 
         return response;
@@ -222,6 +229,8 @@ fn readRequest(allocator: std.mem.Allocator, reader: *std.net.Stream.Reader) !*R
         try request.segments.append(segment);
     }
 
+    var content_length: ?usize = null;
+
     while (true) {
         const header_line = try readHeader(allocator, reader);
 
@@ -230,6 +239,24 @@ fn readRequest(allocator: std.mem.Allocator, reader: *std.net.Stream.Reader) !*R
         }
 
         try request.headers.raw.append(header_line);
+
+        if (std.mem.startsWith(u8, header_line, "Content-Length:")) {
+            if (std.mem.indexOf(u8, header_line, ": ")) |index| {
+                const length = try std.fmt.parseInt(usize, header_line[index + 2 ..], 10);
+
+                if (length > 0) {
+                    content_length = length;
+                }
+            }
+        }
+    }
+
+    if (content_length) |length| {
+        var body: []u8 = undefined;
+        body = try allocator.allocSentinel(u8, length, 0);
+        _ = try reader.read(body);
+
+        request.body = body;
     }
 
     return request;
@@ -277,7 +304,28 @@ fn userAgent(allocator: std.mem.Allocator, request: *Request, stream: std.net.St
     _ = try stream.write(bytes);
 }
 
-fn file(allocator: std.mem.Allocator, request: *Request, stream: std.net.Stream) !void {
+fn postFile(request: *Request, stream: std.net.Stream) !void {
+    if (request.segments.items.len != 2) {
+        _ = try stream.write("HTTP/1.1 422 Unprocessable Content\r\n\r\n");
+        return;
+    }
+
+    const filename = request.segments.items[1];
+    const dir = try std.fs.openDirAbsoluteZ(directory, std.fs.Dir.OpenDirOptions{});
+    const file_handler = try dir.createFile(filename, std.fs.File.CreateFlags{
+        .read = false,
+        .truncate = true,
+    });
+    defer file_handler.close();
+
+    if (request.body) |body| {
+        _ = try file_handler.write(body);
+    }
+
+    _ = try stream.write("HTTP/1.1 201 Created\r\n\r\n");
+}
+
+fn getFile(allocator: std.mem.Allocator, request: *Request, stream: std.net.Stream) !void {
     if (request.segments.items.len != 2) {
         _ = try stream.write("HTTP/1.1 422 Unprocessable Content\r\n\r\n");
         return;
@@ -291,6 +339,7 @@ fn file(allocator: std.mem.Allocator, request: *Request, stream: std.net.Stream)
         _ = try stream.write("HTTP/1.1 404 Not Found\r\n\r\n");
         return;
     };
+    defer file_handler.close();
 
     const file_content = try file_handler.readToEndAlloc(allocator, 1024 * 1024);
 
@@ -309,13 +358,25 @@ fn do(allocator: std.mem.Allocator, conn: std.net.Server.Connection) !void {
     defer request.deinit();
 
     if (std.mem.eql(u8, request.target, "/")) {
-        _ = try conn.stream.write("HTTP/1.1 200 OK\r\n\r\n");
+        switch (request.method) {
+            Method.GET => _ = try conn.stream.write("HTTP/1.1 200 OK\r\n\r\n"),
+            Method.POST => _ = try conn.stream.write("HTTP/1.1 404 Not Found\r\n\r\n"),
+        }
     } else if (std.mem.startsWith(u8, request.target, "/echo")) {
-        return echo(allocator, request, conn.stream);
+        switch (request.method) {
+            Method.GET => return echo(allocator, request, conn.stream),
+            Method.POST => _ = try conn.stream.write("HTTP/1.1 404 Not Found\r\n\r\n"),
+        }
     } else if (std.mem.startsWith(u8, request.target, "/user-agent")) {
-        return userAgent(allocator, request, conn.stream);
+        switch (request.method) {
+            Method.GET => return userAgent(allocator, request, conn.stream),
+            Method.POST => _ = try conn.stream.write("HTTP/1.1 404 Not Found\r\n\r\n"),
+        }
     } else if (std.mem.startsWith(u8, request.target, "/files")) {
-        return file(allocator, request, conn.stream);
+        switch (request.method) {
+            Method.GET => return getFile(allocator, request, conn.stream),
+            Method.POST => return postFile(request, conn.stream),
+        }
     } else {
         _ = try conn.stream.write("HTTP/1.1 404 Not Found\r\n\r\n");
     }
