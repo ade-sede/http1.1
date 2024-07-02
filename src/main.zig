@@ -1,4 +1,5 @@
 const std = @import("std");
+const gzip = std.compress.gzip;
 
 const max_read_length = 1024;
 
@@ -101,22 +102,16 @@ const Response = struct {
         return response;
     }
 
-    pub fn @"404"(allocator: std.mem.Allocator) !*Response {
-        var response = try Response.init(allocator);
-
-        response.code = 404;
-        response.http_version = try allocator.dupe(u8, "HTTP/1.1");
-        response.reason = try allocator.dupe(u8, "Not Found");
-        response.body = null;
+    pub fn @"404"() []const u8 {
+        return "HTTP/1.1 404 Not Found\r\n\r\n";
     }
 
-    pub fn @"422"(allocator: std.mem.Allocator) !*Response {
-        var response = try Response.init(allocator);
+    pub fn @"422"() []const u8 {
+        return "HTTP/1.1 422 Unprocessable Content\r\n\r\n";
+    }
 
-        response.code = 422;
-        response.http_version = try allocator.dupe(u8, "HTTP/1.1");
-        response.reason = try allocator.dupe(u8, "Unprocessable Content");
-        response.body = null;
+    pub fn @"500"() []const u8 {
+        return "HTTP/1.1 500 Server Error\r\n\r\n";
     }
 
     pub fn text(allocator: std.mem.Allocator, txt: []const u8) !*Response {
@@ -128,7 +123,7 @@ const Response = struct {
         response.body = try allocator.dupe(u8, txt);
 
         try response.headers.raw.append(try allocator.dupe(u8, "Content-Type: text/plain"));
-        try response.headers.raw.append(try std.fmt.allocPrint(allocator, "Content-Length: {d}", .{txt.len}));
+        response.headers.content_length = txt.len;
 
         return response;
     }
@@ -142,42 +137,61 @@ const Response = struct {
         response.body = file_content;
 
         try response.headers.raw.append(try allocator.dupe(u8, "Content-Type: application/octet-stream"));
-        try response.headers.raw.append(try std.fmt.allocPrint(allocator, "Content-Length: {d}", .{file_content.len}));
+        response.headers.content_length = file_content.len;
 
         return response;
     }
 
-    fn packHeaders(allocator: std.mem.Allocator, headers: []const []const u8) ![]const u8 {
+    fn packHeaders(self: *Response) ![]const u8 {
         // A header section is of the form
         //
         // header_line\r\n
         // header_line\r\n
         // \r\n (trailing CRLF to mark end of section)
 
-        const packed_headers = try std.mem.join(allocator, "\r\n", headers);
-        defer allocator.free(packed_headers);
+        if (self.headers.content_length) |len| {
+            try self.headers.raw.append(try std.fmt.allocPrint(self.allocator, "Content-Length: {d}", .{len}));
+        }
 
-        if (headers.len != 0) {
-            return std.mem.concat(allocator, u8, &[_][]const u8{ packed_headers, "\r\n", "\r\n" });
+        const packed_headers = try std.mem.join(self.allocator, "\r\n", self.headers.raw.items);
+        defer self.allocator.free(packed_headers);
+
+        if (self.headers.raw.items.len != 0) {
+            return std.mem.concat(self.allocator, u8, &[_][]const u8{ packed_headers, "\r\n", "\r\n" });
         } else {
-            return std.mem.concat(allocator, u8, &[_][]const u8{ packed_headers, "\r\n" });
+            return std.mem.concat(self.allocator, u8, &[_][]const u8{ packed_headers, "\r\n" });
         }
     }
 
     fn encode(self: *Response, request_headers: *Headers) !void {
-        if (request_headers.accept_encoding) |encodings| {
-            const encoding_to_use: []const u8 = blk: {
-                for (encodings.items) |encoding| {
-                    if (std.mem.eql(u8, encoding, "gzip")) {
-                        break :blk "gzip";
+        if (self.body) |uncompressed_body| {
+            if (request_headers.accept_encoding) |encodings| {
+                const encoding_to_use: []const u8 = blk: {
+                    for (encodings.items) |encoding| {
+                        if (std.mem.eql(u8, encoding, "gzip")) {
+                            break :blk "gzip";
+                        }
+                    } else {
+                        return error.InvalidEncodingRequested;
                     }
-                } else {
-                    return error.InvalidEncodingRequested;
-                }
-            };
+                };
 
-            const encoding_header = try std.fmt.allocPrint(self.headers.allocator, "Content-Encoding: {s}", .{encoding_to_use});
-            try self.headers.raw.append(encoding_header);
+                const encoding_header = try std.fmt.allocPrint(self.headers.allocator, "Content-Encoding: {s}", .{encoding_to_use});
+                try self.headers.raw.append(encoding_header);
+
+                if (std.mem.eql(u8, encoding_to_use, "gzip")) {
+                    var compressed = std.ArrayList(u8).init(self.allocator);
+                    defer compressed.deinit();
+
+                    var uncompressed = std.io.fixedBufferStream(uncompressed_body);
+
+                    try gzip.compress(uncompressed.reader(), compressed.writer(), gzip.Options{});
+
+                    self.allocator.free(uncompressed_body);
+                    self.body = try self.allocator.dupe(u8, compressed.items);
+                    self.headers.content_length = compressed.items.len;
+                }
+            }
         }
     }
 
@@ -192,7 +206,7 @@ const Response = struct {
         const status_line = try std.fmt.allocPrint(self.allocator, "{s} {d} {s}\r\n", .{ self.http_version, self.code, self.reason });
         defer self.allocator.free(status_line);
 
-        const header_section = try Response.packHeaders(self.allocator, self.headers.raw.items);
+        const header_section = try self.packHeaders();
         defer self.allocator.free(header_section);
 
         if (self.body) |body| {
@@ -311,7 +325,7 @@ fn readRequest(allocator: std.mem.Allocator, reader: *std.net.Stream.Reader) !*R
 
 fn echo(allocator: std.mem.Allocator, request: *Request, stream: std.net.Stream) !void {
     if (request.segments.items.len != 2) {
-        _ = try stream.write("HTTP/1.1 422 Unprocessable Content\r\n\r\n");
+        _ = try stream.write(Response.@"422"());
         return;
     }
 
@@ -325,7 +339,7 @@ fn echo(allocator: std.mem.Allocator, request: *Request, stream: std.net.Stream)
 
 fn userAgent(allocator: std.mem.Allocator, request: *Request, stream: std.net.Stream) !void {
     if (request.segments.items.len != 1) {
-        _ = try stream.write("HTTP/1.1 422 Unprocessable Content\r\n\r\n");
+        _ = try stream.write(Response.@"422"());
         return;
     }
 
@@ -353,7 +367,7 @@ fn userAgent(allocator: std.mem.Allocator, request: *Request, stream: std.net.St
 
 fn postFile(request: *Request, stream: std.net.Stream) !void {
     if (request.segments.items.len != 2) {
-        _ = try stream.write("HTTP/1.1 422 Unprocessable Content\r\n\r\n");
+        _ = try stream.write(Response.@"422"());
         return;
     }
 
@@ -374,7 +388,7 @@ fn postFile(request: *Request, stream: std.net.Stream) !void {
 
 fn getFile(allocator: std.mem.Allocator, request: *Request, stream: std.net.Stream) !void {
     if (request.segments.items.len != 2) {
-        _ = try stream.write("HTTP/1.1 422 Unprocessable Content\r\n\r\n");
+        _ = try stream.write(Response.@"422"());
         return;
     }
 
@@ -383,7 +397,7 @@ fn getFile(allocator: std.mem.Allocator, request: *Request, stream: std.net.Stre
     const file_handler = dir.openFile(filename, std.fs.File.OpenFlags{
         .mode = .read_only,
     }) catch {
-        _ = try stream.write("HTTP/1.1 404 Not Found\r\n\r\n");
+        _ = try stream.write(Response.@"404"());
         return;
     };
     defer file_handler.close();
@@ -407,17 +421,17 @@ fn do(allocator: std.mem.Allocator, conn: std.net.Server.Connection) !void {
     if (std.mem.eql(u8, request.target, "/")) {
         switch (request.method) {
             Method.GET => _ = try conn.stream.write("HTTP/1.1 200 OK\r\n\r\n"),
-            Method.POST => _ = try conn.stream.write("HTTP/1.1 404 Not Found\r\n\r\n"),
+            Method.POST => _ = try conn.stream.write(Response.@"404"()),
         }
     } else if (std.mem.startsWith(u8, request.target, "/echo")) {
         switch (request.method) {
             Method.GET => return echo(allocator, request, conn.stream),
-            Method.POST => _ = try conn.stream.write("HTTP/1.1 404 Not Found\r\n\r\n"),
+            Method.POST => _ = try conn.stream.write(Response.@"404"()),
         }
     } else if (std.mem.startsWith(u8, request.target, "/user-agent")) {
         switch (request.method) {
             Method.GET => return userAgent(allocator, request, conn.stream),
-            Method.POST => _ = try conn.stream.write("HTTP/1.1 404 Not Found\r\n\r\n"),
+            Method.POST => _ = try conn.stream.write(Response.@"404"()),
         }
     } else if (std.mem.startsWith(u8, request.target, "/files")) {
         switch (request.method) {
@@ -425,7 +439,7 @@ fn do(allocator: std.mem.Allocator, conn: std.net.Server.Connection) !void {
             Method.POST => return postFile(request, conn.stream),
         }
     } else {
-        _ = try conn.stream.write("HTTP/1.1 404 Not Found\r\n\r\n");
+        _ = try conn.stream.write(Response.@"404"());
     }
 }
 
@@ -433,7 +447,7 @@ fn handleConnection(allocator: std.mem.Allocator, conn: std.net.Server.Connectio
     defer conn.stream.close();
 
     do(allocator, conn) catch {
-        _ = conn.stream.write("HTTP/1.1 500 Server Error\r\n\r\n") catch {};
+        _ = conn.stream.write(Response.@"500"()) catch {};
     };
 }
 
