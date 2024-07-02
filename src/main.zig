@@ -291,7 +291,8 @@ fn readRequest(allocator: std.mem.Allocator, reader: *std.net.Stream.Reader) !*R
                 var encoding_iterator = std.mem.splitSequence(u8, encodings, ",");
 
                 while (encoding_iterator.next()) |encoding_format| {
-                    try request.headers.accept_encoding.?.append(encoding_format);
+                    const trimed = std.mem.trim(u8, encoding_format, " ");
+                    try request.headers.accept_encoding.?.append(trimed);
                 }
             }
         }
