@@ -111,6 +111,20 @@ const Response = struct {
         return response;
     }
 
+    pub fn file(allocator: std.mem.Allocator, file_content: []const u8) !*Response {
+        var response = try Response.init(allocator);
+
+        response.code = 200;
+        response.http_version = try allocator.dupe(u8, "HTTP/1.1");
+        response.reason = try allocator.dupe(u8, "OK");
+        response.body = file_content;
+
+        try response.headers.raw.append(try allocator.dupe(u8, "Content-Type: application/octet-stream"));
+        try response.headers.raw.append(try std.fmt.allocPrint(allocator, "Content-Length: {d}", .{file_content.len}));
+
+        return response;
+    }
+
     fn packHeaders(allocator: std.mem.Allocator, headers: []const []const u8) ![]const u8 {
         // A header section is of the form
         //
@@ -250,6 +264,31 @@ fn userAgent(allocator: std.mem.Allocator, request: *Request, stream: std.net.St
     _ = try stream.write(bytes);
 }
 
+fn file(allocator: std.mem.Allocator, request: *Request, stream: std.net.Stream) !void {
+    if (request.segments.items.len != 2) {
+        _ = try stream.write("HTTP/1.1 422 Unprocessable Content\r\n\r\n");
+        return;
+    }
+
+    const filename = request.segments.items[1];
+    const dir = try std.fs.openDirAbsoluteZ(directory, std.fs.Dir.OpenDirOptions{});
+    const file_handler = dir.openFile(filename, std.fs.File.OpenFlags{
+        .mode = .read_only,
+    }) catch {
+        _ = try stream.write("HTTP/1.1 404 Not Found\r\n\r\n");
+        return;
+    };
+
+    const file_content = try file_handler.readToEndAlloc(allocator, 1024 * 1024);
+
+    const response = try Response.file(allocator, file_content);
+    defer response.deinit();
+    const bytes = try response.pack();
+    defer allocator.free(bytes);
+
+    _ = try stream.write(bytes);
+}
+
 fn do(allocator: std.mem.Allocator, conn: std.net.Server.Connection) !void {
     var reader = conn.stream.reader();
 
@@ -258,10 +297,12 @@ fn do(allocator: std.mem.Allocator, conn: std.net.Server.Connection) !void {
 
     if (std.mem.eql(u8, request.target, "/")) {
         _ = try conn.stream.write("HTTP/1.1 200 OK\r\n\r\n");
-    } else if (std.mem.startsWith(u8, request.target, "/echo/")) {
+    } else if (std.mem.startsWith(u8, request.target, "/echo")) {
         return echo(allocator, request, conn.stream);
     } else if (std.mem.startsWith(u8, request.target, "/user-agent")) {
         return userAgent(allocator, request, conn.stream);
+    } else if (std.mem.startsWith(u8, request.target, "/files")) {
+        return file(allocator, request, conn.stream);
     } else {
         _ = try conn.stream.write("HTTP/1.1 404 Not Found\r\n\r\n");
     }
@@ -275,7 +316,20 @@ fn handleConnection(allocator: std.mem.Allocator, conn: std.net.Server.Connectio
     };
 }
 
+var directory: [:0]const u8 = undefined;
+
 pub fn main() !void {
+    var args = std.process.args();
+
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, "--directory", arg)) {
+            directory = args.next() orelse {
+                std.debug.print("Missing directory name", .{});
+                return error.NoDirectoryName;
+            };
+        }
+    }
+
     const address = try std.net.Address.resolveIp("127.0.0.1", 4221);
     var listener = try address.listen(.{
         .reuse_address = true,
